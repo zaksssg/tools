@@ -1,24 +1,21 @@
 /**
- * Original CreateBy @LuxInGame X Luxurious 
+ * Original CreateBy @hiyaok X Luxurious 
  * Follow Original Creator Tik Tok @wztwentythree
  * Bug fixes and improvements by @hiyaok on Telegram
  * Last updated: January 2025
  * 
- * Tested Features:
- * - User management and data persistence ✓
- * - Channel subscription verification ✓
- * - Random photo sending (/pap) ✓
- * - Audio sending (/sadvibes) ✓
- * - Kata-kata messages (/katakata) ✓
- * - Sticker creation (/brat) ✓
- * - Broadcast functionality (/broadcast) ✓
- * - Total users counting (/totalusers) ✓
- * - done all fixxing by @hiyaok on telegram. 
+ * Features:
+ * - User management with data persistence
+ * - Channel subscription verification
+ * - Random photo/audio/message sending
+ * - Sticker creation with proper file handling
+ * - Admin broadcast system
+ * - User counting
  */
 
-//module ni
 const TelegramBot = require('node-telegram-bot-api');
-const fs = require('fs').promises;
+const fs = require('fs').promises;  // For async operations
+const fsSync = require('fs');       // For stream operations
 const axios = require('axios');
 const path = require('path');
 
@@ -30,12 +27,10 @@ const ADMIN_ID = '7065487918';
 // Initialize bot with error handling
 const bot = new TelegramBot(token, {
     polling: true,
-    filepath: false,
-    polling_interval: 1000,
-    timeout: 30
+    filepath: false  // Prevents local file storage issues
 });
 
-// Data file path configuration
+// Data file path with proper path handling
 const dataFile = path.join(__dirname, 'data.json');
 
 // Content arrays
@@ -97,7 +92,6 @@ async function readUsers() {
     }
 }
 
-//dah ke fix
 async function saveUser(userId) {
     try {
         const data = await readUsers();
@@ -125,15 +119,36 @@ async function checkChannelMembership(userId) {
     }
 }
 
+// File download helper with proper stream handling
+async function downloadFile(url, filePath) {
+    try {
+        const writer = fsSync.createWriteStream(filePath);
+        const response = await axios({
+            url,
+            method: 'GET',
+            responseType: 'stream',
+            timeout: 5000
+        });
+
+        return new Promise((resolve, reject) => {
+            response.data.pipe(writer);
+            writer.on('finish', resolve);
+            writer.on('error', (error) => {
+                writer.close();
+                reject(error);
+            });
+        });
+    } catch (error) {
+        throw new Error(`Download failed: ${error.message}`);
+    }
+}
+
 // Start command handler
 bot.onText(/\/start/, async (msg) => {
     const chatId = msg.chat.id;
     
     try {
-        // Save new user
         await saveUser(msg.from.id);
-        
-        // Check channel membership
         const isMember = await checkChannelMembership(msg.from.id);
 
         if (isMember) {
@@ -293,23 +308,6 @@ bot.onText(/\/katakata/, async (msg) => {
     }
 });
 
-// Helper functions
-const downloadFile = async (url, filePath) => {
-    const response = await axios({
-        url,
-        method: 'GET',
-        responseType: 'stream',
-        timeout: 5000
-    });
-    
-    return new Promise((resolve, reject) => {
-        const writer = fs.createWriteStream(filePath);
-        response.data.pipe(writer);
-        writer.on('finish', resolve);
-        writer.on('error', reject);
-    });
-};
-
 // Sticker creation commands
 bot.onText(/^(\.|\#|\/)brat$/, async (msg) => {
     const chatId = msg.chat.id;
@@ -322,23 +320,33 @@ bot.onText(/\/brat (.+)/, async (msg, match) => {
     const tempFilePath = path.join(__dirname, 'temp_sticker.webp');
 
     try {
+        // Ensure the directory exists
+        const dirPath = path.dirname(tempFilePath);
+        await fs.mkdir(dirPath, { recursive: true }).catch(() => {});
+
+        // Download and create sticker
         const imageUrl = `https://kepolu-brat.hf.space/brat?q=${encodeURIComponent(text)}`;
         await downloadFile(imageUrl, tempFilePath);
+        
+        // Send sticker to user
         await bot.sendSticker(chatId, tempFilePath);
     } catch (error) {
         console.error("Error creating sticker:", error);
         await bot.sendMessage(chatId, 'Terjadi kesalahan saat membuat stiker. Silakan coba lagi.');
     } finally {
-        // Always clean up temporary files
+        // Clean up temporary file
         try {
-            await fs.unlink(tempFilePath);
+            const fileExists = await fs.access(tempFilePath).then(() => true).catch(() => false);
+            if (fileExists) {
+                await fs.unlink(tempFilePath);
+            }
         } catch (error) {
             console.error("Error deleting temp file:", error);
         }
     }
 });
 
-// Enhanced error handling
+// Enhanced error handling for the bot
 bot.on('error', (error) => {
     console.error('Bot error:', error);
 });
@@ -351,15 +359,15 @@ bot.on('webhook_error', (error) => {
     console.error('Webhook error:', error);
 });
 
-// Process-level error handling
+// Process-level error handling for unexpected issues
 process.on('unhandledRejection', (reason, promise) => {
     console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-    // Don't exit the process, just log the error
+    // Log the error but don't exit - let the bot continue running
 });
 
 process.on('uncaughtException', (error) => {
     console.error('Uncaught Exception:', error);
-    // Don't exit the process, just log the error
+    // Log the error but don't exit - let the bot continue running
 });
 
 // Graceful shutdown handling
@@ -375,5 +383,6 @@ process.on('SIGINT', async () => {
     }
 });
 
+// Start message
 console.log('Bot is running and ready to handle messages...');
 console.log('Press Ctrl+C to stop the bot.');
