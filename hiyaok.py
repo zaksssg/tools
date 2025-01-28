@@ -242,62 +242,95 @@ class TelegramTool:
             for session in sessions
         }
 
-        # Get and validate group link
-        group_link = Prompt.ask("[yellow]Enter group link or username")
-        first_session = sessions[0]
-        client = TelegramClient(
-            os.path.join(SESSIONS_DIR, first_session),
-            self.config['api_id'],
-            self.config['api_hash']
-        )
-        
-        async with client:
-            try:
-                if group_link.startswith('https://t.me/'):
-                    group_username = group_link.split('/')[-1]
-                else:
-                    group_username = group_link
+        # Get and validate group link with better error handling
+        try:
+            group_link = Prompt.ask("[yellow]Enter group link or username")
+            first_session = sessions[0]
+            
+            client = TelegramClient(
+                os.path.join(SESSIONS_DIR, first_session),
+                self.config['api_id'],
+                self.config['api_hash']
+            )
+            
+            async with client:
+                try:
+                    # Clean up group link
+                    if group_link.startswith(('https://t.me/', 't.me/')):
+                        group_username = group_link.split('/')[-1].split('?')[0]  # Remove any parameters
+                    else:
+                        group_username = group_link.strip()
+                        
+                    entity = await client.get_entity(group_username)
+                    if not hasattr(entity, 'title'):
+                        raise ValueError("Invalid group: must be a channel or supergroup")
+                        
+                    self.logger.log(f"Group validated: {entity.title}", "success")
                     
-                entity = await client.get_entity(group_username)
-                self.logger.log(f"Group validated: {entity.title}", "success")
-            except Exception as e:
-                self.logger.log(f"Invalid group or cannot access: {str(e)}", "error")
-                return
-
-        # Process VCF file
-        vcf_path = Prompt.ask("[yellow]Enter path to VCF file")
-        if not os.path.exists(vcf_path):
-            self.logger.log("VCF file not found!", "error")
+                except ValueError as e:
+                    self.logger.log(f"Invalid group format: {str(e)}", "error")
+                    return
+                except errors.FloodWaitError as e:
+                    self.logger.log(f"Rate limit hit: wait {e.seconds} seconds", "error")
+                    return
+                except Exception as e:
+                    self.logger.log(f"Cannot access group: {str(e)}", "error")
+                    return
+        except Exception as e:
+            self.logger.log(f"Error connecting to Telegram: {str(e)}", "error")
             return
 
+        # Process VCF file with better validation
         try:
+            vcf_path = Prompt.ask("[yellow]Enter path to VCF file")
+            if not os.path.exists(vcf_path):
+                self.logger.log("VCF file not found!", "error")
+                return
+
+            contacts = []
             with open(vcf_path, 'r', encoding='utf-8') as f:
                 vcf_content = f.read()
             
-            contacts = []
             for card in vobject.readComponents(vcf_content):
                 if hasattr(card, 'tel'):
                     for tel in card.tel_list:
                         phone = ''.join(filter(str.isdigit, tel.value))
-                        if phone:
+                        if phone and len(phone) >= 10:  # Basic validation
+                            # Ensure proper format with country code
+                            if not phone.startswith('+'):
+                                phone = '+' + phone
                             contacts.append(phone)
             
             contacts = list(set(contacts))  # Remove duplicates
+            
+            if not contacts:
+                self.logger.log("No valid contacts found in VCF file!", "error")
+                return
+                
             self.logger.log(f"Processed {len(contacts)} unique contacts from VCF", "info")
             
+        except vobject.base.ParseError as e:
+            self.logger.log(f"Invalid VCF format: {str(e)}", "error")
+            return
         except Exception as e:
             self.logger.log(f"Error processing VCF: {str(e)}", "error")
             return
 
-        # Get delay and confirmation
-        delay = float(Prompt.ask("[yellow]Enter delay between invites (in seconds)", default="60"))
-        
+        # Get delay with validation
+        try:
+            delay = float(Prompt.ask("[yellow]Enter delay between invites (in seconds)", default="60"))
+            if delay < 30:
+                self.logger.log("Warning: Short delays may trigger flood limits", "warning")
+        except ValueError:
+            self.logger.log("Invalid delay value! Using default of 60 seconds", "warning")
+            delay = 60
+
         if not Confirm.ask("Start inviting process?"):
             self.logger.log("Operation cancelled", "warning")
             return
 
-        # Distribute contacts among accounts
-        contacts_per_account = len(contacts) // len(sessions)
+        # Distribute contacts with improved logic
+        contacts_per_account = max(1, len(contacts) // len(sessions))
         remaining = len(contacts) % len(sessions)
         
         account_tasks = []
@@ -305,15 +338,16 @@ class TelegramTool:
         
         for i, session in enumerate(sessions):
             extra = 1 if i < remaining else 0
-            end_idx = start_idx + contacts_per_account + extra
+            end_idx = min(start_idx + contacts_per_account + extra, len(contacts))
             account_contacts = contacts[start_idx:end_idx]
-            start_idx = end_idx
             
-            account_tasks.append({
-                'session': session,
-                'contacts': account_contacts,
-                'total_contacts': len(account_contacts)
-            })
+            if account_contacts:  # Only create tasks for accounts with contacts
+                account_tasks.append({
+                    'session': session,
+                    'contacts': account_contacts,
+                    'total_contacts': len(account_contacts)
+                })
+            start_idx = end_idx
 
         # Create live display layout
         layout = Layout()
@@ -337,26 +371,63 @@ class TelegramTool:
             
             try:
                 async with client:
-                    # Join group
-                    try:
-                        stats.status = "joining group"
-                        await client(JoinChannelRequest(entity))
-                        self.logger.log(f"Account {phone} joined group successfully", "success")
-                    except Exception as e:
-                        self.logger.log(f"Account {phone} failed to join group: {str(e)}", "error")
-                        stats.error_details.append(f"Failed to join group: {str(e)}")
-                        return
+                    # Join group with retry mechanism
+                    retry_count = 0
+                    max_retries = 3
+                    
+                    while retry_count < max_retries:
+                        try:
+                            stats.status = "joining group"
+                            await client(JoinChannelRequest(entity))
+                            self.logger.log(f"Account {phone} joined group successfully", "success")
+                            break
+                        except errors.FloodWaitError as e:
+                            wait_time = e.seconds
+                            stats.flood_wait_count += 1
+                            self.logger.log(f"Account {phone} needs to wait {wait_time}s before joining", "warning")
+                            if wait_time > 300:  # Skip if wait time is too long
+                                raise
+                            await asyncio.sleep(wait_time)
+                            retry_count += 1
+                        except Exception as e:
+                            self.logger.log(f"Account {phone} failed to join group: {str(e)}", "error")
+                            stats.error_details.append(f"Failed to join group: {str(e)}")
+                            return
 
                     stats.status = "working"
                     for contact in task['contacts']:
+                        if stats.status == "flood":  # Check if account was marked as flooded
+                            break
+                            
                         stats.current_contact = contact
                         stats.total_attempts += 1
                         
                         try:
-                            await client.invite_to_channel(entity, [contact])
-                            stats.successful_invites += 1
-                            self.logger.log(f"Account {phone} successfully invited {contact}", "success")
-                            await asyncio.sleep(delay)
+                            # Convert phone number to proper format and import contact
+                            clean_phone = ''.join(filter(str.isdigit, contact))
+                            if not clean_phone.startswith('+'):
+                                clean_phone = '+' + clean_phone
+
+                            contact_to_import = InputPhoneContact(
+                                client_id=0,
+                                phone=clean_phone,
+                                first_name='User',
+                                last_name=''
+                            )
+                            
+                            imported_contacts = await client(ImportContactsRequest([contact_to_import]))
+
+                            if imported_contacts and imported_contacts.users:
+                                user = imported_contacts.users[0]
+                                await client(InviteToChannelRequest(
+                                    channel=entity,
+                                    users=[user]
+                                ))
+                                stats.successful_invites += 1
+                                self.logger.log(f"Account {phone} successfully invited {contact}", "success")
+                                await asyncio.sleep(delay)
+                            else:
+                                raise Exception("Could not resolve contact to Telegram user")
                             
                         except errors.FloodWaitError as e:
                             stats.flood_wait_count += 1
@@ -364,6 +435,19 @@ class TelegramTool:
                             stats.error_details.append(f"Flood wait for {e.seconds}s")
                             stats.status = "flood"
                             self.logger.log(f"Account {phone} hit flood limit: {e.seconds}s wait required", "warning")
+                            break
+                            
+                        except errors.UserPrivacyRestrictedError:
+                            stats.failed_invites += 1
+                            stats.error_details.append(f"Privacy settings prevented invite: {contact}")
+                            self.logger.log(f"Cannot invite {contact} due to privacy settings", "warning")
+                            
+                        except errors.PeerFloodError:
+                            stats.flood_wait_count += 1
+                            stats.failed_invites += 1
+                            stats.error_details.append("Peer Flood Error - too many requests")
+                            stats.status = "flood"
+                            self.logger.log(f"Account {phone} hit peer flood limit", "warning")
                             break
                             
                         except Exception as e:
@@ -385,129 +469,143 @@ class TelegramTool:
         # Manage redistribution of work from flooded accounts
         async def redistribute_work():
             while True:
-                # Find flooded accounts with remaining work
-                flooded_tasks = [
-                    task for task in account_tasks 
-                    if self.account_stats[task['session'].replace('.session', '')].status == "flood"
-                    and task['contacts']  # Still has contacts to process
-                ]
-                
-                # Find available accounts
-                available_tasks = [
-                    task for task in account_tasks
-                    if self.account_stats[task['session'].replace('.session', '')].status == "done"
-                ]
-                
-                if not flooded_tasks or not available_tasks:
-                    await asyncio.sleep(5)
-                    continue
-                
-                # Redistribute work
-                for flooded_task in flooded_tasks:
-                    flooded_phone = flooded_task['session'].replace('.session', '')
-                    remaining_contacts = flooded_task['contacts']
+                try:
+                    flooded_tasks = [
+                        task for task in account_tasks 
+                        if self.account_stats[task['session'].replace('.session', '')].status == "flood"
+                        and task['contacts']
+                    ]
                     
-                    if not remaining_contacts:
+                    available_tasks = [
+                        task for task in account_tasks
+                        if self.account_stats[task['session'].replace('.session', '')].status == "done"
+                    ]
+                    
+                    if not flooded_tasks or not available_tasks:
+                        # Check if all tasks are complete
+                        if all(not task['contacts'] for task in account_tasks):
+                            break
+                        await asyncio.sleep(5)
                         continue
-                        
-                    chunks = len(available_tasks)
-                    contacts_per_chunk = len(remaining_contacts) // chunks
                     
-                    for i, available_task in enumerate(available_tasks):
-                        start_idx = i * contacts_per_chunk
-                        end_idx = start_idx + contacts_per_chunk if i < chunks - 1 else len(remaining_contacts)
+                    for flooded_task in flooded_tasks:
+                        flooded_phone = flooded_task['session'].replace('.session', '')
+                        remaining_contacts = flooded_task['contacts']
                         
-                        chunk = remaining_contacts[start_idx:end_idx]
-                        if chunk:
-                            available_phone = available_task['session'].replace('.session', '')
-                            self.logger.log(
-                                f"Redistributing {len(chunk)} contacts from {flooded_phone} to {available_phone}",
-                                "info"
-                            )
-                            available_task['contacts'].extend(chunk)
-                            self.account_stats[available_phone].status = "working"
-                    
-                    # Clear redistributed contacts
-                    flooded_task['contacts'] = []
+                        if not remaining_contacts:
+                            continue
+                            
+                        chunks = len(available_tasks)
+                        contacts_per_chunk = max(1, len(remaining_contacts) // chunks)
+                        
+                        for i, available_task in enumerate(available_tasks):
+                            start_idx = i * contacts_per_chunk
+                            end_idx = start_idx + contacts_per_chunk if i < chunks - 1 else len(remaining_contacts)
+                            
+                            chunk = remaining_contacts[start_idx:end_idx]
+                            if chunk:
+                                available_phone = available_task['session'].replace('.session', '')
+                                self.logger.log(
+                                    f"Redistributing {len(chunk)} contacts from {flooded_phone} to {available_phone}",
+                                    "info"
+                                )
+                                available_task['contacts'].extend(chunk)
+                                self.account_stats[available_phone].status = "working"
+                        
+                        flooded_task['contacts'] = []
 
+                except Exception as e:
+                    self.logger.log(f"Error in redistribution: {str(e)}", "error")
+                
                 await asyncio.sleep(5)
 
-        # Create live display
+        # Create live display with improved error handling
         async def update_display():
-            with Live(layout, refresh_per_second=4) as live:
-                while True:
-                    # Update header
-                    total_contacts = sum(task['total_contacts'] for task in account_tasks)
-                    total_invited = sum(stats.successful_invites for stats in self.account_stats.values())
-                    total_failed = sum(stats.failed_invites for stats in self.account_stats.values())
-                    
-                    header = Table.grid()
-                    header.add_row(f"[bold cyan]Total Progress: {total_invited}/{total_contacts} "
-                                f"(Failed: {total_failed})[/bold cyan]")
-                    layout["header"].update(header)
-                    
-                    # Update progress table
-                    layout["progress"].update(await self.create_progress_table(account_tasks))
-                    
-                    # Update footer with error count
-                    total_errors = sum(len(stats.error_details) for stats in self.account_stats.values())
-                    footer = Table.grid()
-                    footer.add_row(f"[bold red]Total Errors: {total_errors}[/bold red]")
-                    layout["footer"].update(footer)
-                    
-                    # Check if all done
-                    if all(stats.status in ['done', 'error', 'flood'] 
-                          for stats in self.account_stats.values()):
-                        break
+            try:
+                with Live(layout, refresh_per_second=4) as live:
+                    while True:
+                        total_contacts = sum(task['total_contacts'] for task in account_tasks)
+                        total_invited = sum(stats.successful_invites for stats in self.account_stats.values())
+                        total_failed = sum(stats.failed_invites for stats in self.account_stats.values())
                         
-                    await asyncio.sleep(0.25)
+                        header = Table.grid()
+                        header.add_row(f"[bold cyan]Total Progress: {total_invited}/{total_contacts} "
+                                    f"(Failed: {total_failed})[/bold cyan]")
+                        layout["header"].update(header)
+                        
+                        layout["progress"].update(await self.create_progress_table(account_tasks))
+                        
+                        total_errors = sum(len(stats.error_details) for stats in self.account_stats.values())
+                        footer = Table.grid()
+                        footer.add_row(f"[bold red]Total Errors: {total_errors}[/bold red]")
+                        layout["footer"].update(footer)
+                        
+                        if all(stats.status in ['done', 'error', 'flood'] 
+                              for stats in self.account_stats.values()):
+                            break
+                            
+                        await asyncio.sleep(0.25)
+            except Exception as e:
+                self.logger.log(f"Display error: {str(e)}", "error")
 
-        # Start all processes
-        await asyncio.gather(
-            update_display(),
-            redistribute_work(),
-            *[process_account(task) for task in account_tasks]
-        )
-
-        # Final summary
-        self.logger.log("\n===== Final Summary =====", "info")
-        
-        summary_table = Table(show_header=True, header_style="bold magenta")
-        summary_table.add_column("Account")
-        summary_table.add_column("Final Status")
-        summary_table.add_column("Success/Total")
-        summary_table.add_column("Success Rate")
-        summary_table.add_column("Flood Count")
-        summary_table.add_column("Duration")
-        summary_table.add_column("Errors")
-        
-        for task in account_tasks:
-            phone = task['session'].replace('.session', '')
-            stats = self.account_stats[phone]
-            
-            summary_table.add_row(
-                phone,
-                stats.status,
-                f"{stats.successful_invites}/{task['total_contacts']}",
-                f"{stats.success_rate:.1f}%",
-                str(stats.flood_wait_count),
-                f"{stats.duration:.0f}s",
-                str(len(stats.error_details))
+        # Start all processes with proper error handling
+        try:
+            await asyncio.gather(
+                update_display(),
+                redistribute_work(),
+                *[process_account(task) for task in account_tasks]
             )
-        
-        console.print(summary_table)
-        
-        # Print detailed error log if any
-        error_count = sum(len(stats.error_details) for stats in self.account_stats.values())
-        if error_count > 0:
-            self.logger.log("\n===== Error Details =====", "error")
+        except Exception as e:
+            self.logger.log(f"Error in main process: {str(e)}", "error")
+
+        # Final summary with improved error handling
+        try:
+            self.logger.log("\n===== Final Summary =====", "info")
+            
+            summary_table = Table(show_header=True, header_style="bold magenta")
+            summary_table.add_column("Account")
+            summary_table.add_column("Final Status")
+            summary_table.add_column("Success/Total")
+            summary_table.add_column("Success Rate")
+            summary_table.add_column("Flood Count")
+            summary_table.add_column("Duration")
+            summary_table.add_column("Errors")
+            
             for task in account_tasks:
                 phone = task['session'].replace('.session', '')
                 stats = self.account_stats[phone]
-                if stats.error_details:
-                    self.logger.log(f"\nAccount {phone}:", "error")
-                    for i, error in enumerate(stats.error_details, 1):
-                        self.logger.log(f"  {i}. {error}", "error")
+                
+                try:
+                    success_rate = (stats.successful_invites / task['total_contacts'] * 100 
+                                  if task['total_contacts'] > 0 else 0)
+                except ZeroDivisionError:
+                    success_rate = 0
+                
+                summary_table.add_row(
+                    phone,
+                    stats.status,
+                    f"{stats.successful_invites}/{task['total_contacts']}",
+                    f"{success_rate:.1f}%",
+                    str(stats.flood_wait_count),
+                    f"{stats.duration:.0f}s",
+                    str(len(stats.error_details))
+                )
+            
+            console.print(summary_table)
+            
+            # Print detailed error log if any
+            error_count = sum(len(stats.error_details) for stats in self.account_stats.values())
+            if error_count > 0:
+                self.logger.log("\n===== Error Details =====", "error")
+                for task in account_tasks:
+                    phone = task['session'].replace('.session', '')
+                    stats = self.account_stats[phone]
+                    if stats.error_details:
+                        self.logger.log(f"\nAccount {phone}:", "error")
+                        for i, error in enumerate(stats.error_details, 1):
+                            self.logger.log(f"  {i}. {error}", "error")
+        except Exception as e:
+            self.logger.log(f"Error generating summary: {str(e)}", "error")
 
     async def run(self):
         console.print(Panel(ASCII_ART))
